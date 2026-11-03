@@ -1,0 +1,124 @@
+name: build
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['README.md']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: v
+        shell: bash
+        run: |
+          set -e
+          git config user.name bot; git config user.email bot@users.noreply.github.com
+          changed=0
+          if [ -f bootstrap.b64 ]; then
+            base64 -d bootstrap.b64 | tar xz; git rm -q --cached bootstrap.b64 || true; rm -f bootstrap.b64
+            git add -A; git commit -qm "source import" || true; changed=1
+          fi
+          if ls patches/*.diff >/dev/null 2>&1; then
+            for f in $(ls patches/*.diff | sort -V); do git apply --whitespace=nowarn "$f"; git rm -q --cached "$f" || true; rm -f "$f"; done
+            git add -A; git commit -qm "apply patches" || true; changed=1
+          fi
+          [ "$changed" = 1 ] && git push
+          if [ -f src/version.py ]; then
+            echo "version=$(python3 -c "import re;print(re.search(r'VERSION\s*=\s*\"([^\"]+)\"', open('src/version.py',encoding='utf-8').read()).group(1))")" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    runs-on: windows-latest
+    env:
+      V: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+
+      - name: libmpv (mpv 엔진) 받기
+        shell: pwsh
+        run: |
+          $rel = gh api repos/zhongfly/mpv-winbuild/releases/latest | ConvertFrom-Json
+          $a = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d{8}-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
+          if (-not $a) { $a = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-' -and $_.name -notmatch 'v3' } | Select-Object -First 1 }
+          if (-not $a) { throw "mpv-dev asset not found" }
+          Write-Host "libmpv: $($a.name)"
+          Invoke-WebRequest $a.browser_download_url -OutFile mpv-dev.7z
+          7z e mpv-dev.7z libmpv-2.dll -r -y
+          if (-not (Test-Path libmpv-2.dll)) { throw "libmpv-2.dll missing" }
+
+      - name: yt-dlp 받기
+        shell: pwsh
+        run: Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile yt-dlp.exe
+
+      - name: 아이콘
+        run: python tools/make_icon.py app.ico
+
+      - name: PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name CodecFreePlayer --icon app.ico
+          --paths src --hidden-import mpv --hidden-import av --collect-submodules av
+          --add-binary "libmpv-2.dll;." --add-binary "yt-dlp.exe;."
+          --exclude-module tkinter --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick
+          src/main.py
+
+      - name: 실행 검사 (selftest)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\CodecFreePlayer\CodecFreePlayer.exe -ArgumentList '--selftest' -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "selftest timeout" }
+          $log = Get-Content "$env:APPDATA\CodecFreePlayer\selftest.txt" -Raw
+          Write-Host "selftest: $log (exit $($p.ExitCode))"
+          if ($log -notmatch '^OK') { throw "selftest failed" }
+
+      - name: Inno Setup 설치 프로그램
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress | Out-Null
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC not found" }
+          $lang = Join-Path $iscc.DirectoryName "Languages\Korean.isl"
+          if (Test-Path $lang) { Copy-Item $lang Korean.isl }
+          else {
+            try { Invoke-WebRequest https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/Korean.isl -OutFile Korean.isl } catch { Write-Host "Korean.isl 없음 -> 영어" }
+          }
+          # 한글이 깨지지 않게 UTF-8 BOM 으로 저장
+          $txt = Get-Content installer.iss -Raw -Encoding UTF8
+          [IO.File]::WriteAllText("$PWD\installer.iss", $txt, (New-Object Text.UTF8Encoding $true))
+          & $iscc.FullName "/DMyAppVersion=$env:V" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem dist\*.exe
+
+      - name: 릴리스 올리기
+        shell: bash
+        run: |
+          f="dist/CodecFreePlayer-setup-$V.exe"
+          notes="자동 빌드 $V"
+          [ -f CHANGELOG.md ] && notes="$(awk '/^## /{n++} n==1' CHANGELOG.md | head -40)"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release upload "v$V" "$f" --clobber
+          else
+            gh release create "v$V" "$f" -t "코덱무관플레이어 $V" -n "$notes"
+          fi
