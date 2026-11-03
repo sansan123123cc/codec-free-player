@@ -1,0 +1,4 @@
+PySide6-Essentials>=6.7,<6.11
+python-mpv==1.0.8
+av>=13,<17
+numpy>=1.26,<3

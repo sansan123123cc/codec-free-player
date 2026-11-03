@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+libmpv-2.dll
+yt-dlp.exe
+app.ico
+Korean.isl
+mpv-dev.7z
