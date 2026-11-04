@@ -56,6 +56,10 @@ DEFAULTS = {
     "volume_max": 200,
     "audio_preset": "off",
     "audio_channels": "auto",
+    "skip_silence": False,
+    "upscale": "off",               # off | hq | fsr | anime_fast | anime_hq
+    "ambient": False,
+    "accent": "#ff5c8a",
     "eq": [0] * 10,
     "audio_lang": "ko,kor,kr,ja,jpn,en,eng",
     # 자막
@@ -89,6 +93,7 @@ class Store:
         self.recent = h.get("recent", [])         # [path]
         self.bookmarks = h.get("bookmarks", {})   # path -> [[sec, label]]
         self.session = h.get("session", {})       # 마지막 재생 상태 (업데이트 후 복원용)
+        self.watched = h.get("watched", {})       # 다 본 영상 path -> 시각
 
     @staticmethod
     def _load(path, fallback):
@@ -122,6 +127,7 @@ class Store:
                 "recent": self.recent,
                 "bookmarks": self.bookmarks,
                 "session": self.session,
+                "watched": self.watched,
             })
 
     # ---- 이어보기 ----

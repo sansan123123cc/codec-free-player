@@ -12,6 +12,13 @@ except Exception:  # PyAV 없으면 미리보기만 꺼짐
 THUMB_W = 192
 
 
+def _is_cover(s):
+    try:
+        return bool(int(s.disposition) & 0x400)  # 앨범 아트
+    except Exception:
+        return False
+
+
 class Thumbnailer(QObject):
     ready = Signal(str, int, QImage)   # path, bucket, image
 
@@ -71,8 +78,7 @@ class Thumbnailer(QObject):
             return False
         try:
             self.container = av.open(path, options={"probesize": "5000000"})
-            vs = [s for s in self.container.streams if s.type == "video"
-                  and not (s.disposition and getattr(s.disposition, "attached_pic", False))]
+            vs = [s for s in self.container.streams if s.type == "video" and not _is_cover(s)]
             if not vs:
                 self._close()
                 return False

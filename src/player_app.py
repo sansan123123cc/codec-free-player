@@ -8,7 +8,7 @@ import tempfile
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QUrl, QSize, QRect
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QGuiApplication, QDesktopServices, QImage, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QGuiApplication, QDesktopServices, QImage, QKeySequence, QColor
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget, QSplitter,
                                QMenu, QFileDialog, QInputDialog, QMessageBox, QProgressDialog,
                                QApplication, QListWidgetItem, QTabWidget)
@@ -24,6 +24,8 @@ from store import default_shot_dir, data_dir
 from thumbs import Thumbnailer
 from updater import Updater, run_installer, ToolFetcher, update_ytdlp_async
 from version import APP_NAME, VERSION
+from extras_ui import ExtrasMixin
+import widgets as W
 from widgets import (ControlBar, PlaylistPanel, WelcomePage, ThumbPopup, make_icon, fmt_time, build_style,
                      ACCENT, FG, DIM)
 
@@ -94,7 +96,7 @@ class VideoHost(QWidget):
         self.setMinimumSize(160, 90)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(ExtrasMixin, QMainWindow):
     sig_key = Signal(str)
     sig_loaded = Signal()
     sig_end = Signal(str, str)
@@ -105,7 +107,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(make_icon("app", size=256))
         self.setAcceptDrops(True)
-        self.setStyleSheet(build_style())
+        W.ACCENT.setRgb(QColor(store["accent"]).rgb())
+        self.setStyleSheet(build_style(store["accent"]))
         self.setMinimumSize(480, 300)
 
         # 상태
@@ -191,6 +194,9 @@ class MainWindow(QMainWindow):
         b.b_menu.clicked.connect(lambda: self.show_menu(b.b_menu.mapToGlobal(QPoint(0, 0)), above=b.b_menu))
         b.b_speed.clicked.connect(lambda: self._popup(self._speed_menu(), b.b_speed))
         b.b_ab.clicked.connect(self.ab_cycle)
+        b.b_ab.setContextMenuPolicy(Qt.CustomContextMenu)
+        b.b_ab.customContextMenuRequested.connect(self.ab_context_menu)
+        b.b_ab.setToolTip("구간 반복: [ 시작점, ] 끝점, \\ 해제 · 우클릭: 구간을 MP4/GIF로 저장")
         b.b_repeat.clicked.connect(self.cycle_repeat)
         b.b_cc.clicked.connect(self.toggle_sub)
         b.b_cc.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -249,6 +255,7 @@ class MainWindow(QMainWindow):
             self.split.setSizes([self.width() - store["playlist_width"], store["playlist_width"]])
         self._refresh_welcome()
         self._refresh_repeat_icon()
+        self.init_extras()
 
         if after_update and store.session.get("path") and not initial_args:
             sess = store.session
@@ -265,6 +272,8 @@ class MainWindow(QMainWindow):
         extra = {}
         if os.environ.get("CFP_VO"):
             extra["vo"] = os.environ["CFP_VO"]
+        if os.environ.get("CFP_AO"):
+            extra["ao"] = os.environ["CFP_AO"]
         self.m = mpv.MPV(wid=str(int(self.video.winId())), input_default_bindings=False, **extra,
                          input_vo_keyboard=True, osc=False, idle="yes", keep_open="yes",
                          log_handler=self._mpv_log, loglevel="warn")
@@ -823,6 +832,10 @@ class MainWindow(QMainWindow):
             p = it.data(Qt.UserRole)
             if not is_url(p):
                 m.addAction("탐색기에서 보기", lambda: self.reveal(p))
+                if p in self.store.watched or p in self.store.positions:
+                    m.addAction("시청 기록 지우기", lambda: self.unmark_watched(p))
+                else:
+                    m.addAction("다 본 것으로 표시", lambda: self.mark_watched(p))
             m.addSeparator()
         for a in self._playlist_menu().actions():
             m.addAction(a)
@@ -920,6 +933,7 @@ class MainWindow(QMainWindow):
             self.thumbs.set_file(self.current, dur)
         else:
             self.thumbs.set_file(None)
+        self.extras_file_loaded()
         self._refresh_markers()
         if self.ask_resume_pos:
             pos = self.ask_resume_pos
@@ -951,6 +965,7 @@ class MainWindow(QMainWindow):
         self.eof_handled = True
         if self.current and not is_url(self.current):
             self.store.positions.pop(self.current, None)
+            self.mark_watched(self.current)
         if self.store["repeat"] == "one":
             return
         if self.store["autoplay_next"] or self.store["repeat"] == "all":
@@ -1014,6 +1029,7 @@ class MainWindow(QMainWindow):
                     self.window_scale(None)
         # 이어보기 위치 저장
         now = time.time()
+        self.extras_poll(now, pos, pause)
         if self.loaded and now - self.last_save > 5:
             self.last_save = now
             self._save_position(pos, dur)
@@ -1064,6 +1080,8 @@ class MainWindow(QMainWindow):
         if dur is None:
             dur = self._get("duration", None)
         self.store.set_resume(self.current, pos, dur)
+        if pos and dur and dur > 60 and pos > dur - 15:
+            self.mark_watched(self.current)
         self.store.session = {"path": self.current, "pos": pos, "t": int(time.time())}
 
     def _refresh_markers(self):
@@ -1074,7 +1092,7 @@ class MainWindow(QMainWindow):
         sb.update()
 
     def _refresh_welcome(self):
-        self.welcome.set_recent(self.store.recent, self.store.positions)
+        self.welcome.set_recent(self.store.recent, self.store.positions, self.store.watched)
 
     # ================================================================ 재생 조작
     def toggle_pause(self):
@@ -1364,7 +1382,8 @@ class MainWindow(QMainWindow):
             if g:
                 filters.append(f"equalizer=f={f}:width_type=o:width=1:g={g}")
         self._set("audio-channels", s["audio_channels"] or "auto")
-        af = f"lavfi=[{','.join(filters)}]" if filters else ""
+        parts = [f"lavfi=[{','.join(filters)}]"] if filters else []
+        af = ",".join(self.extras_af(parts))
         if not self._set("af", af):
             self._set("af", "")
 
@@ -1819,6 +1838,8 @@ class MainWindow(QMainWindow):
         self._act(zm, "기본값", lambda: (self._set("sub-scale", 1.0), self._set("sub-pos", int(self.store["sub_pos"])),
                                        self.osd("자막 크기·위치 기본값")))
         self._act(m, "자막 모양 설정…", lambda: self.open_settings(tab=3))
+        m.addSeparator()
+        self._act(m, "자동 자막 만들기 (음성 인식)…", self.open_autosub, enabled=self.loaded)
         return m
 
     def build_menu(self):
@@ -1859,6 +1880,7 @@ class MainWindow(QMainWindow):
         for k, t in (("off", "반복 안 함"), ("all", "전체 반복"), ("one", "한 개 반복")):
             self._act(rpm, t, lambda k=k: self.set_repeat(k), checked=self.store["repeat"] == k)
         self._act(pm, "무작위 재생", self.toggle_shuffle, checked=self.store["shuffle"])
+        self._act(pm, "무음 구간 빨리 감기", self.toggle_skip_silence, checked=self.store["skip_silence"])
         chs = self._get("chapter-list", []) or []
         if chs:
             cm = pm.addMenu(f"챕터 ({len(chs)})")
@@ -1914,6 +1936,9 @@ class MainWindow(QMainWindow):
         self._act(zm, "아래로", lambda: self.pan(0, -0.05))
         self._act(zm, "초기화", self.zoom_reset, "Ctrl+0")
         self._act(vm, "영상 조정 (밝기·대비·채도)…", self.open_adjust)
+        self.upscale_menu(vm)
+        self._act(vm, "앰비언트 모드 (여백을 장면 색으로)", self.toggle_ambient, checked=self.store["ambient"])
+        self.theme_menu(vm)
         dim = vm.addMenu("디인터레이스")
         for k, t in (("auto", "자동"), ("yes", "켬"), ("no", "끔")):
             self._act(dim, t, lambda k=k: self.set_deinterlace(k), checked=self.store["deinterlace"] == k)
@@ -1953,8 +1978,10 @@ class MainWindow(QMainWindow):
         self._act(sm, "자막 없이 캡처", lambda: self.screenshot(False), enabled=loaded)
         self._act(sm, "클립보드로 복사", self.screenshot_clipboard, "Ctrl+C", enabled=loaded)
         self._act(sm, "캡처 폴더 열기", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self._shot_dir())))
+        self.capture_extras(sm)
         m.addSeparator()
         self._act(m, "재생목록", self.toggle_playlist, "P", checked=self.plist.isVisible())
+        self._act(m, "폰 리모컨" + (" (켜짐)" if self.remote else "") + "…", self.open_remote)
         self._act(m, "미디어 정보", self.media_info, "Ctrl+I", enabled=loaded)
         m.addSeparator()
         self._act(m, "환경설정…", self.open_settings, "F5")
@@ -2121,6 +2148,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "updating", False):
             self.store.session = {}
         self.store.save()
+        self.extras_close()
         self.thumbs.stop()
         self.thumb_popup.close()
         for d in (self.eq_dlg, self.adjust_dlg):

@@ -528,7 +528,7 @@ class WelcomePage(QWidget):
         v.addWidget(hint)
         v.addStretch(3)
 
-    def set_recent(self, paths, positions):
+    def set_recent(self, paths, positions, watched=None):
         self.recent.clear()
         shown = 0
         for p in paths:
@@ -541,6 +541,8 @@ class WelcomePage(QWidget):
             e = positions.get(p)
             if e and e.get("dur"):
                 name += f"   ·  {fmt_time(e['pos'])} / {fmt_time(e['dur'])}에서 이어보기"
+            elif watched and p in watched:
+                name += "   ·  ✓ 다 봄"
             it = QListWidgetItem(name)
             it.setToolTip(p)
             it.setData(Qt.UserRole, p)
@@ -606,7 +608,7 @@ QProgressBar::chunk {{ background: #ff5c8a; border-radius: 4px; }}
 """
 
 
-def build_style():
+def build_style(accent="#ff5c8a"):
     """체크 표시 그림을 임시 폴더에 만들어 스타일시트에 연결."""
     import tempfile
     path = os.path.join(tempfile.gettempdir(), "cfp_check.png").replace("\\", "/")
@@ -620,5 +622,10 @@ def build_style():
         p.end()
         pm.save(path, "PNG")
     except Exception:
-        return STYLE.replace("image: url(CHECKMARK);", "")
-    return STYLE.replace("CHECKMARK", path)
+        return _accent(STYLE.replace("image: url(CHECKMARK);", ""), accent)
+    return _accent(STYLE.replace("CHECKMARK", path), accent)
+
+
+def _accent(css, accent):
+    c = QColor(accent)
+    return css.replace("#ff5c8a", c.name()).replace("rgba(255,92,138,", f"rgba({c.red()},{c.green()},{c.blue()},")
