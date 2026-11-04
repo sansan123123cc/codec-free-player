@@ -528,6 +528,29 @@ class WelcomePage(QWidget):
         v.addWidget(hint)
         v.addStretch(3)
 
+    def set_background(self, path, dim=55):
+        self.bg = QPixmap(path) if path else None
+        if self.bg is not None and self.bg.isNull():
+            self.bg = None
+        self.bg_dim = dim
+        self.update()
+
+    def paintEvent(self, e):
+        bg = getattr(self, "bg", None)
+        if bg is None:
+            return super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = self.rect()
+        s = bg.scaled(r.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        p.drawPixmap((r.width() - s.width()) // 2, (r.height() - s.height()) // 2, s)
+        a = int(255 * getattr(self, "bg_dim", 55) / 100)
+        g = QLinearGradient(0, 0, 0, r.height())
+        g.setColorAt(0, QColor(21, 21, 27, max(0, a - 40)))
+        g.setColorAt(0.5, QColor(21, 21, 27, a))
+        g.setColorAt(1, QColor(21, 21, 27, min(255, a + 40)))
+        p.fillRect(r, QBrush(g))
+
     def set_recent(self, paths, positions, watched=None):
         self.recent.clear()
         shown = 0

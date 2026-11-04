@@ -60,6 +60,11 @@ DEFAULTS = {
     "upscale": "off",               # off | hq | fsr | anime_fast | anime_hq
     "ambient": False,
     "accent": "#ff5c8a",
+    "interpolation": False,
+    "music_viz": "cqt",             # cqt | waves | spectrum | off
+    "yt_cookies": "",               # "" | browser:whale | file:경로
+    "welcome_bg": "",
+    "welcome_dim": 55,
     "eq": [0] * 10,
     "audio_lang": "ko,kor,kr,ja,jpn,en,eng",
     # 자막

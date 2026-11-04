@@ -25,6 +25,7 @@ from thumbs import Thumbnailer
 from updater import Updater, run_installer, ToolFetcher, update_ytdlp_async
 from version import APP_NAME, VERSION
 from extras_ui import ExtrasMixin
+from extras2 import ExtrasMixin2
 import widgets as W
 from widgets import (ControlBar, PlaylistPanel, WelcomePage, ThumbPopup, make_icon, fmt_time, build_style,
                      ACCENT, FG, DIM)
@@ -96,7 +97,7 @@ class VideoHost(QWidget):
         self.setMinimumSize(160, 90)
 
 
-class MainWindow(ExtrasMixin, QMainWindow):
+class MainWindow(ExtrasMixin, ExtrasMixin2, QMainWindow):
     sig_key = Signal(str)
     sig_loaded = Signal()
     sig_end = Signal(str, str)
@@ -256,6 +257,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self._refresh_welcome()
         self._refresh_repeat_icon()
         self.init_extras()
+        self.init_extras2()
 
         if after_update and store.session.get("path") and not initial_args:
             sess = store.session
@@ -496,6 +498,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
             "size_150": lambda: self.window_scale(1.5), "size_200": lambda: self.window_scale(2.0),
             "bookmark": self.add_bookmark, "open_file": self.open_file_dialog, "open_url": self.open_url_dialog,
             "paste": self.paste, "settings": self.open_settings, "help": self.show_help,
+            "youtube": self.open_youtube,
         }
         if act == "seek_percent":
             k = (key or "0")[-1]
@@ -671,6 +674,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self._set("ab-loop-b", "no")
         self._set("loop-file", "inf" if self.store["repeat"] == "one" else "no")
         try:
+            self.extras2_before_load()
             self.m.command("loadfile", path, "replace")
         except Exception as ex:
             self.osd(f"열기 실패: {ex}")
@@ -934,6 +938,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         else:
             self.thumbs.set_file(None)
         self.extras_file_loaded()
+        self.extras2_file_loaded()
         self._refresh_markers()
         if self.ask_resume_pos:
             pos = self.ask_resume_pos
@@ -1840,6 +1845,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self._act(m, "자막 모양 설정…", lambda: self.open_settings(tab=3))
         m.addSeparator()
         self._act(m, "자동 자막 만들기 (음성 인식)…", self.open_autosub, enabled=self.loaded)
+        self._act(m, "지금 자막을 한국어로 번역…", self.translate_current_sub, enabled=self.loaded)
         return m
 
     def build_menu(self):
@@ -1851,6 +1857,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self._act(om, "폴더 열기…", self.open_folder_dialog)
         self._act(om, "주소(URL) 열기… (유튜브 등)", self.open_url_dialog, "Ctrl+U")
         self._act(om, "클립보드에서 열기", self.paste, "Ctrl+V")
+        self._act(om, "유튜브에서 찾기…", self.open_youtube, "Ctrl+Y")
         self._act(om, "자막 파일 불러오기…", lambda: self.load_sub(), enabled=loaded)
         rm = om.addMenu("최근 파일")
         for p in self.store.recent[:15]:
@@ -1939,6 +1946,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self.upscale_menu(vm)
         self._act(vm, "앰비언트 모드 (여백을 장면 색으로)", self.toggle_ambient, checked=self.store["ambient"])
         self.theme_menu(vm)
+        self.view_menu_extras2(vm)
         dim = vm.addMenu("디인터레이스")
         for k, t in (("auto", "자동"), ("yes", "켬"), ("no", "끔")):
             self._act(dim, t, lambda k=k: self.set_deinterlace(k), checked=self.store["deinterlace"] == k)
@@ -1981,6 +1989,7 @@ class MainWindow(ExtrasMixin, QMainWindow):
         self.capture_extras(sm)
         m.addSeparator()
         self._act(m, "재생목록", self.toggle_playlist, "P", checked=self.plist.isVisible())
+        self._act(m, "유튜브…", self.open_youtube, "Ctrl+Y")
         self._act(m, "폰 리모컨" + (" (켜짐)" if self.remote else "") + "…", self.open_remote)
         self._act(m, "미디어 정보", self.media_info, "Ctrl+I", enabled=loaded)
         m.addSeparator()
