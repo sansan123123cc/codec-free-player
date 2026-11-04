@@ -79,7 +79,7 @@ jobs:
       - name: PyInstaller
         run: >
           pyinstaller --noconfirm --clean --windowed --name CodecFreePlayer --icon app.ico
-          --paths src --hidden-import mpv --hidden-import av --collect-submodules av
+          --paths src --hidden-import mpv --hidden-import av --collect-submodules av --hidden-import PIL.Image --hidden-import qrcode
           --add-binary "libmpv-2.dll;." --add-binary "yt-dlp.exe;."
           --exclude-module tkinter --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick
           src/main.py
