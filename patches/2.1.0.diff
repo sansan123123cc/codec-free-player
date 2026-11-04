@@ -1,16 +1,3 @@
-diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
-index e580996..a1686f1 100644
---- a/.github/workflows/build.yml
-+++ b/.github/workflows/build.yml
-@@ -79,7 +79,7 @@ jobs:
-       - name: PyInstaller
-         run: >
-           pyinstaller --noconfirm --clean --windowed --name CodecFreePlayer --icon app.ico
--          --paths src --hidden-import mpv --hidden-import av --collect-submodules av
-+          --paths src --hidden-import mpv --hidden-import av --collect-submodules av --hidden-import PIL.Image --hidden-import qrcode
-           --add-binary "libmpv-2.dll;." --add-binary "yt-dlp.exe;."
-           --exclude-module tkinter --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick
-           src/main.py
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 index 733139a..1dccd09 100644
 --- a/CHANGELOG.md
