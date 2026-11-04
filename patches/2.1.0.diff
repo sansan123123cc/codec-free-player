@@ -1,0 +1,1457 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index e580996..a1686f1 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -79,7 +79,7 @@ jobs:
+       - name: PyInstaller
+         run: >
+           pyinstaller --noconfirm --clean --windowed --name CodecFreePlayer --icon app.ico
+-          --paths src --hidden-import mpv --hidden-import av --collect-submodules av
++          --paths src --hidden-import mpv --hidden-import av --collect-submodules av --hidden-import PIL.Image --hidden-import qrcode
+           --add-binary "libmpv-2.dll;." --add-binary "yt-dlp.exe;."
+           --exclude-module tkinter --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick
+           src/main.py
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 733139a..1dccd09 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,16 @@
+ # 변경 기록
+ 
++## 2.1.0
++- 화질 올리기: 고품질 확대 / FSR / 애니 업스케일(Anime4K 빠름·고품질) — 화면 메뉴
++- 시청 기록: 재생목록에 진행률 막대와 다 본 영상 ✓ 표시, 시작 화면에 '다 봄' 표시
++- A-B 구간을 MP4 또는 GIF로 저장 (A-B 버튼 우클릭 / 캡처 메뉴)
++- 장면 미리보기 시트(4x4) 만들기
++- 폰 리모컨: 같은 와이파이에서 폰으로 QR 찍고 조작
++- 앰비언트 모드: 영상 바깥 여백이 장면 색으로 은은하게 물듦
++- 무음 구간 빨리 감기
++- 테마 색 고르기 (화면 → 테마 색)
++- 자동 자막 만들기 (자막 메뉴): 음성 인식 → 원어 / 영어 / 한국어(인터넷 번역) 자막
++
+ ## 2.0.0
+ - 재생 엔진을 mpv(libmpv)로 교체 — HEVC·AV1·VP9·MKV 등 코덱 설치 없이 재생, 하드웨어 가속
+ - 새 화면: 시작 화면(최근 재생), 하단 컨트롤바, 시크바 미리보기 썸네일, 챕터·북마크·구간 표시
+diff --git a/requirements.txt b/requirements.txt
+index f61ebb0..a06171f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,3 +2,5 @@ PySide6-Essentials>=6.7,<6.11
+ python-mpv==1.0.8
+ av>=13,<17
+ numpy>=1.26,<3
++pillow>=10
++qrcode>=7.4
+diff --git a/src/extras_ui.py b/src/extras_ui.py
+new file mode 100644
+index 0000000..9d572bb
+--- /dev/null
++++ b/src/extras_ui.py
+@@ -0,0 +1,549 @@
++"""v2.1 기능을 메인 창에 붙이는 부분 (MainWindow 가 이 클래스를 같이 상속)."""
++import json
++import os
++import re
++import sys
++import threading
++import time
++import urllib.parse
++import urllib.request
++
++from PySide6.QtCore import Qt, QTimer, QRect, QUrl
++from PySide6.QtGui import QColor, QDesktopServices, QPixmap, QGuiApplication, QPen
++from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QProgressDialog,
++                               QMessageBox, QFileDialog, QStyledItemDelegate, QColorDialog, QFormLayout, QDialogButtonBox,
++                               QStyle)
++
++import features as F
++import widgets as W
++from store import data_dir
++
++THEMES = [("#ff5c8a", "핑크"), ("#a07cff", "라벤더"), ("#4da3ff", "하늘"), ("#2ec4a6", "민트"),
++          ("#ff9f43", "오렌지"), ("#ff4d5e", "레드"), ("#c8c8d2", "실버")]
++
++
++def tools_dir():
++    d = os.path.join(data_dir(), "tools")
++    os.makedirs(d, exist_ok=True)
++    return d
++
++
++class PlaylistDelegate(QStyledItemDelegate):
++    """재생목록 항목 아래 진행률 막대 + 다 본 영상 ✓ 표시."""
++
++    def __init__(self, store, parent=None):
++        super().__init__(parent)
++        self.store = store
++
++    def paint(self, p, opt, idx):
++        super().paint(p, opt, idx)
++        path = idx.data(Qt.UserRole)
++        if not path:
++            return
++        r = opt.rect
++        if path in self.store.watched:
++            p.save()
++            p.setPen(QColor("#7ee0a0"))
++            p.drawText(QRect(r.right() - 26, r.top(), 22, r.height()), Qt.AlignCenter, "✓")
++            p.restore()
++        e = self.store.positions.get(path)
++        if e and e.get("dur"):
++            frac = max(0.0, min(1.0, e["pos"] / e["dur"]))
++            p.save()
++            y = r.bottom() - 3
++            p.fillRect(QRect(r.left() + 6, y, r.width() - 12, 2), QColor(255, 255, 255, 40))
++            p.fillRect(QRect(r.left() + 6, y, int((r.width() - 12) * frac), 2), W.ACCENT)
++            p.restore()
++
++
++class ExtrasMixin:
++    # ------------------------------------------------------------ 초기화
++    def init_extras(self):
++        self.jobs = []
++        self.remote = None
++        self.amb_cur = QColor(0, 0, 0)
++        self.amb_last = 0
++        self.sil_fast = False
++        self.sil_prev_speed = 1.0
++        self.remote_last = 0
++        self.plist.list.setItemDelegate(PlaylistDelegate(self.store, self.plist.list))
++        self._def_scalers = {k: self._get(k) for k in ("scale", "cscale", "dscale", "deband")}
++        if self.store["upscale"] != "off":
++            QTimer.singleShot(0, lambda: self.set_upscale(self.store["upscale"], quiet=True))
++
++    def extras_file_loaded(self):
++        if self.store["ambient"] and self.current and "://" not in self.current:
++            self.thumbs.set_file(self.current, self._get("duration", 0) or 0)
++
++    # ------------------------------------------------------------ 주기 처리 (_poll 에서 호출)
++    def extras_poll(self, now, pos, pause):
++        s = self.store
++        # 무음 구간 빨리 감기
++        if s["skip_silence"] and self.loaded:
++            md = self._get("af-metadata/sd", {}) or {}
++            try:
++                st_ = float(md.get("lavfi.silence_start", -1))
++                en_ = float(md.get("lavfi.silence_end", -1))
++            except (TypeError, ValueError):
++                st_, en_ = -1, -1
++            silent = st_ >= 0 and st_ > en_
++            if silent and not self.sil_fast and not pause:
++                self.sil_fast = True
++                self.sil_prev_speed = self._get("speed", 1.0) or 1.0
++                self._set("speed", max(3.0, self.sil_prev_speed))
++                self.osd("무음 구간 빨리 감는 중 ▶▶", 800)
++            elif not silent and self.sil_fast:
++                self.sil_fast = False
++                self._set("speed", self.sil_prev_speed)
++        elif self.sil_fast:
++            self.sil_fast = False
++            self._set("speed", self.sil_prev_speed)
++        # 앰비언트 모드
++        if s["ambient"] and self.loaded and pos is not None:
++            if now - self.amb_last > 0.4:
++                self.amb_last = now
++                img = self.thumbs.get(pos)
++                if img is not None:
++                    c = img.scaled(1, 1, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).pixelColor(0, 0)
++                    h, sat, v, _ = c.getHsvF()
++                    self.amb_target = QColor.fromHsvF(max(0, h), min(1.0, sat * 1.15), min(1.0, v * 0.42))
++            t = getattr(self, "amb_target", None)
++            if t is not None:
++                cur = self.amb_cur
++                nr = cur.redF() + (t.redF() - cur.redF()) * 0.12
++                ng = cur.greenF() + (t.greenF() - cur.greenF()) * 0.12
++                nb = cur.blueF() + (t.blueF() - cur.blueF()) * 0.12
++                nc = QColor.fromRgbF(nr, ng, nb)
++                if nc.name() != cur.name():
++                    self._bg(nc.name())
++                self.amb_cur = nc
++        # 리모컨 상태
++        if self.remote and now - self.remote_last > 0.4:
++            self.remote_last = now
++            title = ""
++            if self.current:
++                title = self._get("media-title", "") or os.path.basename(self.current)
++            self.remote.state = {
++                "title": title if self.loaded else "", "pos": pos or 0, "dur": self._get("duration", 0) or 0,
++                "pause": bool(pause), "vol": self._get("volume", 0) or 0, "mute": bool(self._get("mute", False)),
++                "speed": self._get("speed", 1.0) or 1.0,
++            }
++
++    def _bg(self, color):
++        if not self._set("background-color", color):
++            self._set("background", color)
++
++    # ------------------------------------------------------------ 소리 필터 (무음 감지 붙이기)
++    def extras_af(self, parts):
++        if self.store["skip_silence"]:
++            parts.append("@sd:lavfi=[silencedetect=n=-35dB:d=0.5]")
++        return parts
++
++    def toggle_skip_silence(self):
++        self.store["skip_silence"] = not self.store["skip_silence"]
++        self.apply_af()
++        self.osd("무음 구간 빨리 감기 " + ("켬" if self.store["skip_silence"] else "끔"))
++
++    def toggle_ambient(self):
++        self.store["ambient"] = not self.store["ambient"]
++        if self.store["ambient"]:
++            self.extras_file_loaded()
++            self.osd("앰비언트 모드 켬 — 영상 바깥 여백이 장면 색으로 물들어요", 2500)
++        else:
++            self.amb_target = None
++            self.amb_cur = QColor(0, 0, 0)
++            self._bg("#000000")
++            self.osd("앰비언트 모드 끔")
++
++    # ------------------------------------------------------------ 시청 기록
++    def mark_watched(self, path):
++        if path and "://" not in path:
++            self.store.watched[path] = int(time.time())
++            self.plist.list.viewport().update()
++
++    def unmark_watched(self, path):
++        self.store.watched.pop(path, None)
++        self.store.positions.pop(path, None)
++        self.plist.list.viewport().update()
++
++    # ------------------------------------------------------------ 테마
++    def set_theme(self, color):
++        if not color:
++            c = QColorDialog.getColor(QColor(self.store["accent"]), self, "테마 색 고르기")
++            if not c.isValid():
++                return
++            color = c.name()
++        self.store["accent"] = color
++        W.ACCENT.setRgb(QColor(color).rgb())
++        self.setStyleSheet(W.build_style(color))
++        self._refresh_repeat_icon()
++        self._highlight_playlist()
++        self.bar.seek.update()
++        self.osd("테마 색 변경")
++
++    def theme_menu(self, parent):
++        m = parent.addMenu("테마 색")
++        for col, name in THEMES:
++            self._act(m, name, lambda col=col: self.set_theme(col), checked=self.store["accent"].lower() == col)
++        self._act(m, "직접 고르기…", lambda: self.set_theme(None))
++        return m
++
++    # ------------------------------------------------------------ 화질 올리기
++    def set_upscale(self, mode, quiet=False):
++        files = F.shader_files(tools_dir(), mode)
++        if files is None:
++            if quiet:
++                return
++            job = F.Job(F.fetch_shaders, tools_dir(), mode)
++            self.run_job(job, "화질 필터 받는 중", lambda _: self.set_upscale(mode))
++            return
++        self.store["upscale"] = mode
++        d = self._def_scalers
++        self._set("glsl-shaders", "")
++        for k in ("scale", "cscale", "dscale", "deband"):
++            if d.get(k) is not None:
++                self._set(k, d[k])
++        if mode == "hq":
++            self._set("scale", "ewa_lanczossharp")
++            self._set("cscale", "ewa_lanczossharp")
++            self._set("dscale", "mitchell")
++            self._set("deband", True)
++        elif files:
++            ok = self._set("glsl-shaders", os.pathsep.join(files))
++            if not ok:
++                self.osd("화질 필터를 적용하지 못했어요 (그래픽 출력이 셰이더를 지원하지 않음)", 3000)
++                return
++        if not quiet:
++            label = dict(F.UPSCALE_LABELS).get(mode, mode)
++            self.osd(f"화질 올리기: {label}", 2000)
++
++    def upscale_menu(self, parent):
++        m = parent.addMenu("화질 올리기 (업스케일)")
++        for k, label in F.UPSCALE_LABELS:
++            self._act(m, label, lambda k=k: self.set_upscale(k), checked=self.store["upscale"] == k)
++        return m
++
++    # ------------------------------------------------------------ 백그라운드 작업 공통
++    def run_job(self, job, title, on_done=None, modal=False):
++        dlg = QProgressDialog(title, "취소", 0, 100, self)
++        dlg.setWindowTitle(title)
++        dlg.setMinimumDuration(0)
++        dlg.setWindowModality(Qt.WindowModal if modal else Qt.NonModal)
++        dlg.setAutoClose(False)
++        dlg.setAutoReset(False)
++        dlg.setMinimumWidth(380)
++        dlg.show()
++        self.jobs.append(job)
++
++        def cancel():
++            job.cancelled = True
++            p = getattr(job, "proc", None)
++            if p:
++                try:
++                    p.kill()
++                except Exception:
++                    pass
++
++        def prog(pct, text):
++            dlg.setValue(pct)
++            if text:
++                dlg.setLabelText(f"{title}\n{text}")
++
++        def done(res):
++            dlg.close()
++            if job in self.jobs:
++                self.jobs.remove(job)
++            if on_done:
++                on_done(res)
++
++        def fail(msg):
++            dlg.close()
++            if job in self.jobs:
++                self.jobs.remove(job)
++            if msg != "취소됨":
++                QMessageBox.warning(self, title, f"실패했어요: {msg}")
++        dlg.canceled.connect(cancel)
++        job.progress.connect(prog)
++        job.done.connect(done)
++        job.failed.connect(fail)
++        job.start()
++        return job
++
++    # ------------------------------------------------------------ 구간 저장 / GIF / 장면 시트
++    def _local_current(self):
++        if not self.loaded or not self.current or "://" in self.current:
++            self.osd("내 컴퓨터에 있는 영상에서만 쓸 수 있어요")
++            return None
++        return self.current
++
++    def export_ab(self, kind):
++        src = self._local_current()
++        if not src:
++            return
++        a = self._get("ab-loop-a", "no")
++        b = self._get("ab-loop-b", "no")
++        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
++            QMessageBox.information(self, "구간 저장", "먼저 구간을 찍어 주세요.\n[ 키로 시작점, ] 키로 끝점을 정하면 돼요.")
++            return
++        if kind == "gif" and b - a > 30:
++            QMessageBox.information(self, "GIF 만들기", "GIF는 30초까지만 만들 수 있어요. 앞 30초만 저장할게요.")
++        base = os.path.splitext(os.path.basename(src))[0]
++        name = f"{base}_{W.fmt_time(a).replace(':', '')}-{W.fmt_time(b).replace(':', '')}.{kind}"
++        dst, _ = QFileDialog.getSaveFileName(self, "구간 저장", os.path.join(self._shot_dir(), name),
++                                             "GIF (*.gif)" if kind == "gif" else "MP4 영상 (*.mp4)")
++        if not dst:
++            return
++        job = F.Job(F.export_clip, src, float(a), float(b), dst, kind)
++        self.run_job(job, "GIF 만드는 중" if kind == "gif" else "구간 저장 중",
++                     lambda path: self._saved(path, "저장 완료"))
++
++    def make_scene_sheet(self):
++        src = self._local_current()
++        if not src:
++            return
++        base = os.path.splitext(os.path.basename(src))[0]
++        dst = os.path.join(self._shot_dir(), f"{base}_장면시트.png")
++        job = F.Job(F.scene_sheet, src, dst, 4, 4, 400, os.path.basename(src))
++        self.run_job(job, "장면 미리보기 시트 만드는 중",
++                     lambda path: (QDesktopServices.openUrl(QUrl.fromLocalFile(path)), self._saved(path, "장면 시트 저장")))
++
++    def _saved(self, path, msg):
++        self.osd(f"{msg}: {os.path.basename(path)}", 2500)
++        if sys.platform == "win32":
++            self.reveal(path)
++
++    def ab_context_menu(self, pos=None):
++        from PySide6.QtWidgets import QMenu
++        m = QMenu(self)
++        loaded = self.loaded
++        self._act(m, "시작점 A 찍기  [", self.ab_set_a, enabled=loaded)
++        self._act(m, "끝점 B 찍기  ]", self.ab_set_b, enabled=loaded)
++        self._act(m, "해제  \\", self.ab_clear)
++        m.addSeparator()
++        self._act(m, "이 구간을 MP4로 저장…", lambda: self.export_ab("mp4"), enabled=loaded)
++        self._act(m, "이 구간을 GIF로 저장…", lambda: self.export_ab("gif"), enabled=loaded)
++        self._popup(m, self.bar.b_ab)
++
++    def capture_extras(self, sm):
++        loaded = self.loaded
++        sm.addSeparator()
++        self._act(sm, "A-B 구간을 MP4로 저장…", lambda: self.export_ab("mp4"), enabled=loaded)
++        self._act(sm, "A-B 구간을 GIF로 저장…", lambda: self.export_ab("gif"), enabled=loaded)
++        self._act(sm, "장면 미리보기 시트 만들기 (4x4)", self.make_scene_sheet, enabled=loaded)
++
++    # ------------------------------------------------------------ 폰 리모컨
++    def open_remote(self):
++        if self.remote is None:
++            try:
++                self.remote = F.RemoteServer(self.store["accent"])
++                self.remote.command.connect(self._remote_cmd)
++                self.remote.start()
++            except Exception as e:
++                self.remote = None
++                QMessageBox.warning(self, "폰 리모컨", f"리모컨을 켜지 못했어요: {e}")
++                return
++        url = self.remote.url()
++        dlg = QDialog(self)
++        dlg.setWindowTitle("폰 리모컨")
++        v = QVBoxLayout(dlg)
++        t = QLabel("폰 카메라로 QR을 찍거나 아래 주소를 폰 브라우저에 입력하세요.\n(폰과 PC가 같은 와이파이/공유기에 있어야 해요)")
++        t.setWordWrap(True)
++        v.addWidget(t)
++        img = F.qr_image(url, 7)
++        if img is not None:
++            q = QLabel()
++            q.setPixmap(QPixmap.fromImage(img))
++            q.setAlignment(Qt.AlignCenter)
++            v.addWidget(q)
++        u = QLabel(f"<b>{url}</b>")
++        u.setTextInteractionFlags(Qt.TextSelectableByMouse)
++        u.setAlignment(Qt.AlignCenter)
++        v.addWidget(u)
++        note = QLabel("처음 켜면 Windows 방화벽 창이 뜰 수 있어요 → '개인 네트워크' 허용을 눌러 주세요.\n"
++                      "주소에 비밀 코드가 들어 있어서 주소를 아는 기기만 조작할 수 있어요.")
++        note.setObjectName("dim")
++        note.setWordWrap(True)
++        v.addWidget(note)
++        h = QHBoxLayout()
++        cp = QPushButton("주소 복사")
++        cp.clicked.connect(lambda: QGuiApplication.clipboard().setText(url))
++        off = QPushButton("리모컨 끄기")
++        off.clicked.connect(lambda: (self.stop_remote(), dlg.accept()))
++        close = QPushButton("닫기 (켜 둔 채로)")
++        close.clicked.connect(dlg.accept)
++        h.addWidget(cp)
++        h.addStretch(1)
++        h.addWidget(off)
++        h.addWidget(close)
++        v.addLayout(h)
++        dlg.exec()
++
++    def stop_remote(self):
++        if self.remote:
++            self.remote.stop()
++            self.remote = None
++            self.osd("폰 리모컨 끔")
++
++    def _remote_cmd(self, c, v):
++        try:
++            x = float(v) if v not in ("", None) else 0.0
++        except ValueError:
++            x = 0.0
++        if c == "pause":
++            self.toggle_pause()
++        elif c == "seek":
++            self.seek_rel(x)
++        elif c == "goto":
++            self.seek_abs(x)
++        elif c == "prev":
++            self.prev()
++        elif c == "next":
++            self.next(manual=True)
++        elif c == "vol":
++            self.change_volume(x)
++        elif c == "mute":
++            self.toggle_mute()
++        elif c == "fullscreen":
++            self.toggle_fullscreen()
++        elif c == "speed":
++            self.set_speed(1.0) if x == 0 else self.change_speed(x)
++        elif c == "sub":
++            self.toggle_sub()
++
++    # ------------------------------------------------------------ 자동 자막
++    def open_autosub(self):
++        src = self._local_current()
++        if not src:
++            return
++        if sys.platform != "win32":
++            QMessageBox.information(self, "자동 자막", "자동 자막은 Windows 버전에서만 돼요.")
++            return
++        mdir = os.path.join(data_dir(), "models")
++        dlg = QDialog(self)
++        dlg.setWindowTitle("자동 자막 만들기")
++        dlg.setMinimumWidth(460)
++        v = QVBoxLayout(dlg)
++        info = QLabel("영상의 말소리를 듣고 자막을 만들어요. 처음 한 번은 자막 엔진과 음성 인식 모델을 받아요.\n"
++                      "PC 성능에 따라 영상 길이의 절반~2배 정도 걸려요. 만드는 동안 계속 봐도 돼요.")
++        info.setWordWrap(True)
++        v.addWidget(info)
++        f = QFormLayout()
++        cm = QComboBox()
++        for k, (label, _) in F.WHISPER_MODELS.items():
++            got = os.path.isfile(os.path.join(mdir, f"ggml-{k}.bin"))
++            cm.addItem(f"{k} — {label}" + ("  ✓받음" if got else ""), k)
++        cm.setCurrentIndex(1)
++        cl = QComboBox()
++        for code, name in (("ja", "일본어"), ("auto", "자동 감지"), ("en", "영어"), ("ko", "한국어"), ("zh", "중국어")):
++            cl.addItem(name, code)
++        ct = QComboBox()
++        ct.addItem("한국어 자막으로 번역 (인터넷 번역 사용)", "ko")
++        ct.addItem("말한 언어 그대로 자막", "orig")
++        ct.addItem("영어 자막으로 번역 (오프라인)", "en")
++        f.addRow("음성 인식 모델", cm)
++        f.addRow("영상 속 언어", cl)
++        f.addRow("만들 자막", ct)
++        v.addLayout(f)
++        note = QLabel("※ 한국어 번역은 음성 인식 결과를 구글 무료 번역으로 옮겨요 (인터넷 필요, 가끔 막힐 수 있어요).")
++        note.setObjectName("dim")
++        note.setWordWrap(True)
++        v.addWidget(note)
++        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
++        bb.button(QDialogButtonBox.Ok).setText("자막 만들기")
++        bb.button(QDialogButtonBox.Cancel).setText("취소")
++        bb.accepted.connect(dlg.accept)
++        bb.rejected.connect(dlg.reject)
++        v.addWidget(bb)
++        if not dlg.exec():
++            return
++        model, lang, target = cm.currentData(), cl.currentData(), ct.currentData()
++        base = os.path.splitext(src)[0]
++        suffix = {"ko": "ko", "en": "en", "orig": lang if lang != "auto" else "orig"}[target]
++        out = f"{base}.auto.{suffix}.srt"
++        if not os.access(os.path.dirname(src) or ".", os.W_OK):
++            out = os.path.join(data_dir(), "subs", os.path.basename(out))
++            os.makedirs(os.path.dirname(out), exist_ok=True)
++
++        def work(job):
++            raw = out if target != "ko" else out.replace(".ko.srt", ".orig.srt")
++            F.make_subtitles(job, tools_dir(), mdir, src, model, lang, target == "en", raw)
++            if target == "ko":
++                job.report(99, "한국어로 번역 중…")
++                translate_srt(raw, out, "ko", lang if lang != "auto" else "auto")
++            return out
++        job = F.Job(work)
++        self.run_job(job, "자동 자막 만드는 중", lambda path: self._autosub_done(src, path))
++
++    def _autosub_done(self, src, path):
++        if self.current == src and self.loaded:
++            self.load_sub(path)
++        self.osd(f"자막 완성: {os.path.basename(path)}", 3000)
++
++    # ------------------------------------------------------------ 종료
++    def extras_close(self):
++        for j in list(self.jobs):
++            j.cancelled = True
++            p = getattr(j, "proc", None)
++            if p:
++                try:
++                    p.kill()
++                except Exception:
++                    pass
++        self.stop_remote()
++
++
++# ------------------------------------------------------------------ SRT 번역
++def _parse_srt(text):
++    blocks = re.split(r"\r?\n\s*\r?\n", text.strip())
++    out = []
++    for b in blocks:
++        lines = b.splitlines()
++        if len(lines) >= 2 and "-->" in lines[1]:
++            out.append([lines[0], lines[1], " ".join(l.strip() for l in lines[2:])])
++        elif len(lines) >= 1 and "-->" in lines[0]:
++            out.append([str(len(out) + 1), lines[0], " ".join(l.strip() for l in lines[1:])])
++    return out
++
++
++def _gtx(text, sl, tl):
++    q = urllib.parse.urlencode({"client": "gtx", "sl": sl, "tl": tl, "dt": "t", "q": text})
++    req = urllib.request.Request("https://translate.googleapis.com/translate_a/single?" + q,
++                                 headers={"User-Agent": "Mozilla/5.0"})
++    with urllib.request.urlopen(req, timeout=30) as r:
++        d = json.loads(r.read().decode("utf-8"))
++    return "".join(seg[0] for seg in d[0] if seg and seg[0])
++
++
++def translate_srt(src, dst, tl="ko", sl="auto"):
++    with open(src, "r", encoding="utf-8", errors="replace") as fh:
++        cues = _parse_srt(fh.read())
++    texts = [c[2] for c in cues]
++    result = [None] * len(texts)
++    i = 0
++    while i < len(texts):
++        chunk, size, j = [], 0, i
++        while j < len(texts) and size + len(texts[j]) < 3500 and len(chunk) < 80:
++            chunk.append(texts[j].replace("\n", " "))
++            size += len(texts[j]) + 1
++            j += 1
++        if not chunk:
++            chunk, j = [texts[i]], i + 1
++        try:
++            tr = _gtx("\n".join(chunk), sl, tl).split("\n")
++        except Exception:
++            tr = []
++        if len(tr) == len(chunk):
++            result[i:j] = [t.strip() for t in tr]
++        else:
++            for k in range(i, j):  # 줄 수가 안 맞으면 한 줄씩
++                try:
++                    result[k] = _gtx(texts[k], sl, tl).strip()
++                except Exception:
++                    result[k] = texts[k]
++                time.sleep(0.05)
++        i = j
++        time.sleep(0.2)
++    with open(dst, "w", encoding="utf-8") as fh:
++        for n, (c, t) in enumerate(zip(cues, result), 1):
++            fh.write(f"{n}\n{c[1]}\n{t or c[2]}\n\n")
++    return dst
+diff --git a/src/features.py b/src/features.py
+new file mode 100644
+index 0000000..6b1d61b
+--- /dev/null
++++ b/src/features.py
+@@ -0,0 +1,560 @@
++"""v2.1 추가 기능: 구간 저장(mp4/GIF), 장면 미리보기 시트, 폰 리모컨, 자동 자막(whisper), 화질 셰이더."""
++import json
++import os
++import random
++import re
++import socket
++import string
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import urllib.parse
++import urllib.request
++import zipfile
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++from PySide6.QtCore import QObject, Signal, Qt, QRectF
++from PySide6.QtGui import QImage, QPainter, QColor, QFont
++
++try:
++    import av
++except Exception:
++    av = None
++
++UA = {"User-Agent": "CodecFreePlayer"}
++from fractions import Fraction
++A_TB = Fraction(1, 48000)
++NOWIN = 0x08000000 if sys.platform == "win32" else 0
++
++
++def _fmt(sec):
++    sec = int(max(0, sec or 0))
++    h, r = divmod(sec, 3600)
++    m, s = divmod(r, 60)
++    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
++
++
++def download(url, dst, progress=None, cancel=None):
++    tmp = dst + ".part"
++    req = urllib.request.Request(url, headers=UA)
++    with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
++        total = int(r.headers.get("Content-Length") or 0)
++        got = 0
++        while True:
++            if cancel and cancel():
++                raise RuntimeError("취소됨")
++            b = r.read(512 * 1024)
++            if not b:
++                break
++            f.write(b)
++            got += len(b)
++            if progress:
++                progress(got, total)
++    os.replace(tmp, dst)
++    return dst
++
++
++def is_cover(s):
++    """앨범 아트(첨부 그림) 스트림인지. AV_DISPOSITION_ATTACHED_PIC = 0x400"""
++    try:
++        return bool(int(s.disposition) & 0x400)
++    except Exception:
++        return False
++
++
++def _first_video(c):
++    for s in c.streams.video:
++        if not is_cover(s):
++            return s
++    return None
++
++
++class Job(QObject):
++    """백그라운드 작업 공통: progress(퍼센트, 글자), done(결과), failed(메시지)."""
++    progress = Signal(int, str)
++    done = Signal(str)
++    failed = Signal(str)
++
++    def __init__(self, fn, *args):
++        super().__init__()
++        self.cancelled = False
++        self.fn = fn
++        self.args = args
++
++    def start(self):
++        threading.Thread(target=self._run, daemon=True).start()
++        return self
++
++    def _run(self):
++        try:
++            self.done.emit(self.fn(self, *self.args) or "")
++        except Exception as e:
++            self.failed.emit(str(e))
++
++    def report(self, pct, text=""):
++        if self.cancelled:
++            raise RuntimeError("취소됨")
++        self.progress.emit(int(max(0, min(100, pct))), text)
++
++
++# ------------------------------------------------------------------ 구간 저장
++def export_clip(job, src, a, b, dst, kind):
++    """src 의 a~b 초 구간을 mp4(H.264+AAC) 또는 GIF 로 저장."""
++    if av is None:
++        raise RuntimeError("PyAV 없음")
++    if b - a < 0.2:
++        raise RuntimeError("구간이 너무 짧아요")
++    if kind == "gif" and b - a > 30:
++        b = a + 30
++    inp = av.open(src)
++    vs = _first_video(inp)
++    if vs is None:
++        raise RuntimeError("영상 트랙이 없어요")
++    vs.thread_type = "AUTO"
++    aus = inp.streams.audio[0] if (inp.streams.audio and kind == "mp4") else None
++    W, H = vs.codec_context.width, vs.codec_context.height
++    sar = vs.sample_aspect_ratio
++    if sar and sar.numerator and sar.denominator and sar != 1:
++        W = int(W * sar.numerator / sar.denominator)
++    maxw = 480 if kind == "gif" else 1920
++    if W > maxw:
++        H = int(H * maxw / W)
++        W = maxw
++    W, H = W // 2 * 2, H // 2 * 2
++    rate = vs.average_rate or vs.guessed_rate or 30
++    fps = min(float(rate), 15.0 if kind == "gif" else 60.0)
++    inp.seek(int(a / vs.time_base) + (vs.start_time or 0), stream=vs, backward=True, any_frame=False)
++
++    frames_gif = []
++    out = ov = oa = res = None
++    if kind == "mp4":
++        out = av.open(dst, "w")
++        fr = Fraction(fps).limit_denominator(1001)
++        ov = out.add_stream("libx264", rate=fr)
++        ov.width, ov.height, ov.pix_fmt = W, H, "yuv420p"
++        ov.options = {"crf": "20", "preset": "veryfast"}
++        if aus is not None:
++            oa = out.add_stream("aac", rate=48000)
++            oa.layout = "stereo"
++            res = av.AudioResampler(format="fltp", layout="stereo", rate=48000)
++    next_v = 0
++    a_samples = 0
++    a_started = False
++    v_done = False
++    a_done = aus is None
++    streams = [vs] + ([aus] if aus is not None else [])
++    for pkt in inp.demux(*streams):
++        if v_done and a_done:
++            break
++        if pkt.dts is None and pkt.size == 0:
++            continue
++        for frame in pkt.decode():
++            t = frame.time
++            if t is None:
++                continue
++            if pkt.stream is vs:
++                if v_done or t < a - 0.001:
++                    continue
++                if t > b:
++                    v_done = True
++                    continue
++                idx = int(round((t - a) * fps))
++                if idx < next_v:
++                    continue
++                img = frame.reformat(width=W, height=H, format="rgb24" if kind == "gif" else "yuv420p")
++                if kind == "gif":
++                    frames_gif.append(img.to_image())
++                else:
++                    img.pts = idx
++                    img.time_base = 1 / fr
++                    for p in ov.encode(img):
++                        out.mux(p)
++                next_v = idx + 1
++                job.report((t - a) / (b - a) * 100, f"{_fmt(t - a)} / {_fmt(b - a)}")
++            else:
++                if a_done or t < a - 0.05:
++                    continue
++                if t > b:
++                    a_done = True
++                    continue
++                for rf in res.resample(frame):
++                    if not a_started:
++                        a_started = True
++                    rf.pts = a_samples
++                    rf.time_base = A_TB
++                    a_samples += rf.samples
++                    for p in oa.encode(rf):
++                        out.mux(p)
++    inp.close()
++    if kind == "mp4":
++        for p in ov.encode():
++            out.mux(p)
++        if oa is not None:
++            for rf in res.resample(None):
++                rf.pts = a_samples
++                rf.time_base = A_TB
++                a_samples += rf.samples
++                for p in oa.encode(rf):
++                    out.mux(p)
++            for p in oa.encode():
++                out.mux(p)
++        out.close()
++    else:
++        if not frames_gif:
++            raise RuntimeError("프레임을 읽지 못했어요")
++        job.report(99, "GIF 저장 중…")
++        pal = [f.convert("P", palette=1, colors=256) for f in frames_gif]  # 1 = ADAPTIVE
++        pal[0].save(dst, save_all=True, append_images=pal[1:], duration=int(1000 / fps), loop=0, optimize=True,
++                    disposal=1)
++    return dst
++
++
++# ------------------------------------------------------------------ 장면 미리보기 시트
++def scene_sheet(job, src, dst, cols=4, rows=4, cell_w=400, title=""):
++    if av is None:
++        raise RuntimeError("PyAV 없음")
++    c = av.open(src)
++    vs = _first_video(c)
++    if vs is None:
++        raise RuntimeError("영상 트랙이 없어요")
++    vs.thread_type = "AUTO"
++    dur = (c.duration / 1_000_000) if c.duration else (float(vs.duration * vs.time_base) if vs.duration else 0)
++    if dur <= 0:
++        raise RuntimeError("영상 길이를 알 수 없어요")
++    w0, h0 = vs.codec_context.width, vs.codec_context.height
++    sar = vs.sample_aspect_ratio
++    disp_w = w0 * (sar.numerator / sar.denominator if sar and sar.numerator and sar.denominator else 1)
++    cell_h = int(cell_w * h0 / max(1, disp_w)) // 2 * 2
++    n = cols * rows
++    shots = []
++    for i in range(n):
++        t = dur * (i + 0.5) / n
++        c.seek(int(t / vs.time_base) + (vs.start_time or 0), stream=vs, backward=True, any_frame=False)
++        img = None
++        for fr in c.decode(vs):
++            if fr.time is not None and fr.time + 0.5 < t and i > 0:
++                continue
++            rgb = fr.reformat(width=cell_w, height=cell_h, format="rgb24").to_ndarray()
++            img = QImage(rgb.data, cell_w, cell_h, rgb.strides[0], QImage.Format_RGB888).copy()
++            t = fr.time if fr.time is not None else t
++            break
++        shots.append((t, img))
++        job.report((i + 1) / n * 95, f"{i + 1}/{n}")
++    size = os.path.getsize(src) if os.path.exists(src) else 0
++    c.close()
++    pad, head = 8, 86
++    W = cols * cell_w + (cols + 1) * pad
++    H = head + rows * cell_h + (rows + 1) * pad
++    sheet = QImage(W, H, QImage.Format_RGB32)
++    sheet.fill(QColor(18, 18, 24))
++    p = QPainter(sheet)
++    p.setRenderHint(QPainter.Antialiasing)
++    p.setRenderHint(QPainter.TextAntialiasing)
++    f = QFont("Malgun Gothic", 15, QFont.Bold)
++    p.setFont(f)
++    p.setPen(QColor("white"))
++    p.drawText(QRectF(pad * 2, 10, W - 4 * pad, 32), Qt.AlignLeft | Qt.AlignVCenter, title or os.path.basename(src))
++    f2 = QFont("Malgun Gothic", 11)
++    p.setFont(f2)
++    p.setPen(QColor(190, 190, 200))
++    info = f"길이 {_fmt(dur)}   ·   해상도 {w0}x{h0}   ·   크기 {size / 1048576:.1f} MB   ·   코덱 {vs.codec_context.name}"
++    p.drawText(QRectF(pad * 2, 44, W - 4 * pad, 28), Qt.AlignLeft | Qt.AlignVCenter, info)
++    ft = QFont("Consolas", 11, QFont.Bold)
++    for i, (t, img) in enumerate(shots):
++        x = pad + (i % cols) * (cell_w + pad)
++        y = head + pad + (i // cols) * (cell_h + pad)
++        if img is not None:
++            p.drawImage(x, y, img)
++        p.setFont(ft)
++        label = _fmt(t)
++        tw = p.fontMetrics().horizontalAdvance(label) + 12
++        p.fillRect(QRectF(x + cell_w - tw - 6, y + cell_h - 26, tw, 20), QColor(0, 0, 0, 170))
++        p.setPen(QColor("white"))
++        p.drawText(QRectF(x + cell_w - tw - 6, y + cell_h - 26, tw, 20), Qt.AlignCenter, label)
++    p.end()
++    sheet.save(dst)
++    job.report(100)
++    return dst
++
++
++# ------------------------------------------------------------------ 화질 셰이더
++ANIME4K_URL = "https://github.com/bloc97/Anime4K/releases/download/v4.0.1/Anime4K_v4.0.zip"
++FSR_URL = "https://gist.githubusercontent.com/agyild/82219c545228d70c5604f865ce0b0ce5/raw/FSR.glsl"
++ANIME4K_SETS = {
++    "anime_fast": ["Anime4K_Clamp_Highlights.glsl", "Anime4K_Restore_CNN_M.glsl", "Anime4K_Upscale_CNN_x2_M.glsl",
++                   "Anime4K_AutoDownscalePre_x2.glsl", "Anime4K_AutoDownscalePre_x4.glsl", "Anime4K_Upscale_CNN_x2_S.glsl"],
++    "anime_hq": ["Anime4K_Clamp_Highlights.glsl", "Anime4K_Restore_CNN_VL.glsl", "Anime4K_Upscale_CNN_x2_VL.glsl",
++                 "Anime4K_AutoDownscalePre_x2.glsl", "Anime4K_AutoDownscalePre_x4.glsl", "Anime4K_Upscale_CNN_x2_M.glsl"],
++}
++UPSCALE_LABELS = [
++    ("off", "끄기 (기본)"),
++    ("hq", "고품질 확대 + 계단 현상 줄이기 (가벼움)"),
++    ("fsr", "FSR 선명하게 (실사·게임)"),
++    ("anime_fast", "애니 업스케일 Anime4K (빠름)"),
++    ("anime_hq", "애니 업스케일 Anime4K (고품질 · 좋은 그래픽카드)"),
++]
++
++
++def shader_files(tools, mode):
++    """필요한 셰이더 파일 경로 목록 (없으면 None)."""
++    if mode == "fsr":
++        p = os.path.join(tools, "shaders", "FSR.glsl")
++        return [p] if os.path.isfile(p) else None
++    if mode in ANIME4K_SETS:
++        d = os.path.join(tools, "shaders", "anime4k")
++        ps = [os.path.join(d, n) for n in ANIME4K_SETS[mode]]
++        return ps if all(os.path.isfile(x) for x in ps) else None
++    return []
++
++
++def fetch_shaders(job, tools, mode):
++    d = os.path.join(tools, "shaders")
++    os.makedirs(d, exist_ok=True)
++    if mode == "fsr":
++        download(FSR_URL, os.path.join(d, "FSR.glsl"), lambda g, t: job.report(g * 100 / t if t else 50, "FSR 받는 중"))
++    else:
++        z = os.path.join(tempfile.gettempdir(), "anime4k.zip")
++        download(ANIME4K_URL, z, lambda g, t: job.report(g * 100 / t if t else 50, "Anime4K 받는 중"))
++        out = os.path.join(d, "anime4k")
++        os.makedirs(out, exist_ok=True)
++        with zipfile.ZipFile(z) as zf:
++            for n in zf.namelist():
++                if n.lower().endswith(".glsl"):
++                    with zf.open(n) as s, open(os.path.join(out, os.path.basename(n)), "wb") as t:
++                        t.write(s.read())
++    return mode
++
++
++# ------------------------------------------------------------------ 자동 자막 (whisper.cpp)
++WHISPER_ZIP = "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip"
++WHISPER_MODELS = {
++    "base": ("빠름 · 정확도 보통 (142MB)", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"),
++    "small": ("보통 · 추천 (466MB)", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
++    "medium": ("느림 · 가장 정확 (1.5GB)", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
++}
++
++
++def whisper_exe(tools):
++    d = os.path.join(tools, "whisper")
++    for n in ("whisper-cli.exe", "main.exe", "whisper-cli"):
++        if os.path.isfile(os.path.join(d, n)):
++            return os.path.join(d, n)
++    return None
++
++
++def extract_audio_16k(job, src, wav, start_pct=0, span=20):
++    import wave
++    c = av.open(src)
++    if not c.streams.audio:
++        raise RuntimeError("소리 트랙이 없어요")
++    st = c.streams.audio[0]
++    dur = (c.duration / 1_000_000) if c.duration else 0
++    res = av.AudioResampler(format="s16", layout="mono", rate=16000)
++    with wave.open(wav, "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(16000)
++        last = 0
++        for fr in c.decode(st):
++            for r in res.resample(fr):
++                w.writeframes(bytes(r.planes[0])[: r.samples * 2])
++            if dur and fr.time and fr.time - last > 5:
++                last = fr.time
++                job.report(start_pct + span * fr.time / dur, f"소리 추출 {int(fr.time * 100 / dur)}%")
++        for r in res.resample(None):
++            w.writeframes(bytes(r.planes[0])[: r.samples * 2])
++    c.close()
++    return dur
++
++
++def make_subtitles(job, tools, models_dir, src, model, lang, translate, out_srt):
++    os.makedirs(models_dir, exist_ok=True)
++    exe = whisper_exe(tools)
++    if not exe:
++        z = os.path.join(tempfile.gettempdir(), "whisper-bin.zip")
++        download(WHISPER_ZIP, z, lambda g, t: job.report(g * 10 / t if t else 5, "자막 엔진 받는 중"), lambda: job.cancelled)
++        d = os.path.join(tools, "whisper")
++        os.makedirs(d, exist_ok=True)
++        with zipfile.ZipFile(z) as zf:
++            for n in zf.namelist():
++                base = os.path.basename(n)
++                if base and base.lower().endswith((".exe", ".dll")):
++                    with zf.open(n) as s, open(os.path.join(d, base), "wb") as t:
++                        t.write(s.read())
++        exe = whisper_exe(tools)
++        if not exe:
++            raise RuntimeError("자막 엔진 파일을 찾지 못했어요")
++    mpath = os.path.join(models_dir, f"ggml-{model}.bin")
++    if not os.path.isfile(mpath):
++        download(WHISPER_MODELS[model][1], mpath,
++                 lambda g, t: job.report(10 + (g * 30 / t if t else 10), f"음성 인식 모델 받는 중 {g / 1048576:.0f}MB"),
++                 lambda: job.cancelled)
++    wav = os.path.join(tempfile.gettempdir(), "cfp_whisper.wav")
++    dur = extract_audio_16k(job, src, wav, 40, 10)
++    base = os.path.splitext(out_srt)[0]
++    threads = max(2, (os.cpu_count() or 4) - 1)
++    args = [exe, "-m", mpath, "-f", wav, "-osrt", "-of", base, "-pp", "-t", str(threads)]
++    args += ["-l", lang or "auto"]
++    if translate:
++        args.append("-tr")
++    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NOWIN,
++                         cwd=os.path.dirname(exe), text=True, encoding="utf-8", errors="replace")
++    job.proc = p
++    last_t = 0.0
++    for line in p.stdout:
++        if job.cancelled:
++            p.kill()
++            raise RuntimeError("취소됨")
++        m = re.search(r"progress\s*=\s*(\d+)%", line)
++        if m:
++            job.report(50 + int(m.group(1)) / 2, f"음성 인식 {m.group(1)}%")
++            continue
++        m = re.search(r"\[(\d+):(\d+):(\d+)\.\d+\s*-->\s*(\d+):(\d+):(\d+)", line)
++        if m and dur:
++            h, mi, s = int(m.group(4)), int(m.group(5)), int(m.group(6))
++            last_t = h * 3600 + mi * 60 + s
++            job.report(50 + 50 * last_t / dur, f"음성 인식 {_fmt(last_t)} / {_fmt(dur)}")
++    p.wait()
++    try:
++        os.remove(wav)
++    except Exception:
++        pass
++    if p.returncode != 0 or not os.path.isfile(base + ".srt"):
++        raise RuntimeError(f"음성 인식 실패 (코드 {p.returncode})")
++    if base + ".srt" != out_srt:
++        os.replace(base + ".srt", out_srt)
++    return out_srt
++
++
++# ------------------------------------------------------------------ 폰 리모컨
++REMOTE_HTML = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
++<title>코덱무관플레이어 리모컨</title><style>
++:root{--a:ACCENT}*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
++body{margin:0;background:#121218;color:#eee;font-family:-apple-system,'Malgun Gothic',sans-serif;padding:16px;user-select:none}
++h1{font-size:15px;color:#aaa;margin:0 0 6px;font-weight:600}#t{font-size:18px;font-weight:700;margin-bottom:12px;word-break:break-all}
++#bar{width:100%;accent-color:var(--a)}#tm{display:flex;justify-content:space-between;color:#aaa;font-size:13px;margin:2px 0 16px}
++.g{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
++button{background:#23232c;border:1px solid #33333d;color:#fff;border-radius:14px;padding:18px 0;font-size:17px;font-weight:600}
++button:active{background:var(--a)}#pp{background:var(--a);border-color:var(--a);font-size:26px}
++.s{font-size:14px;padding:14px 0}</style></head><body>
++<h1>코덱무관플레이어 리모컨</h1><div id="t">-</div>
++<input id="bar" type="range" min="0" max="1000" value="0"><div id="tm"><span id="p">0:00</span><span id="v">볼륨 -</span><span id="d">0:00</span></div>
++<div class="g"><button onclick="c('seek',-10)">⟲ 10초</button><button id="pp" onclick="c('pause')">⏯</button><button onclick="c('seek',10)">10초 ⟳</button></div>
++<div class="g"><button onclick="c('prev')">⏮ 이전</button><button onclick="c('fullscreen')">⛶ 전체화면</button><button onclick="c('next')">다음 ⏭</button></div>
++<div class="g"><button onclick="c('vol',-5)">🔉 -</button><button onclick="c('mute')">🔇 음소거</button><button onclick="c('vol',5)">🔊 +</button></div>
++<div class="g"><button class="s" onclick="c('speed',-0.25)">느리게</button><button class="s" id="sp" onclick="c('speed',0)">1.0x</button><button class="s" onclick="c('speed',0.25)">빠르게</button></div>
++<div class="g"><button class="s" onclick="c('seek',-60)">-1분</button><button class="s" onclick="c('sub')">자막 켜기/끄기</button><button class="s" onclick="c('seek',60)">+1분</button></div>
++<script>
++const K=new URLSearchParams(location.search).get('k');let drag=false,dur=0;
++function f(s){s=Math.max(0,s|0);let h=s/3600|0,m=(s%3600)/60|0,x=s%60;return(h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')}
++function c(cmd,v){fetch('/api/cmd?k='+K+'&c='+cmd+(v!==undefined?'&v='+v:'')).then(()=>setTimeout(u,150))}
++const bar=document.getElementById('bar');bar.oninput=()=>{drag=true;document.getElementById('p').textContent=f(bar.value/1000*dur)};
++bar.onchange=()=>{c('goto',bar.value/1000*dur);drag=false};
++function u(){fetch('/api/state?k='+K).then(r=>r.json()).then(s=>{document.getElementById('t').textContent=s.title||'(재생 중인 영상 없음)';dur=s.dur||0;
++if(!drag){bar.value=dur?s.pos/dur*1000:0;document.getElementById('p').textContent=f(s.pos)}document.getElementById('d').textContent=f(dur);
++document.getElementById('v').textContent=s.mute?'음소거':'볼륨 '+Math.round(s.vol)+'%';document.getElementById('pp').textContent=s.pause?'▶':'⏸';
++document.getElementById('sp').textContent=(+s.speed).toFixed(2).replace(/0$/,'')+'x'}).catch(()=>{})}
++u();setInterval(u,1000);
++</script></body></html>"""
++
++
++def lan_ip():
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    try:
++        s.connect(("10.255.255.255", 1))
++        return s.getsockname()[0]
++    except Exception:
++        return "127.0.0.1"
++    finally:
++        s.close()
++
++
++class RemoteServer(QObject):
++    command = Signal(str, str)
++
++    def __init__(self, accent="#ff5c8a"):
++        super().__init__()
++        self.state = {}
++        self.token = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
++        self.httpd = None
++        self.port = None
++        self.accent = accent
++
++    def start(self):
++        owner = self
++
++        class H(BaseHTTPRequestHandler):
++            def log_message(self, *a):
++                pass
++
++            def _send(self, code, body, ctype):
++                b = body.encode("utf-8") if isinstance(body, str) else body
++                self.send_response(code)
++                self.send_header("Content-Type", ctype)
++                self.send_header("Content-Length", str(len(b)))
++                self.send_header("Cache-Control", "no-store")
++                self.end_headers()
++                self.wfile.write(b)
++
++            def do_GET(self):
++                u = urllib.parse.urlparse(self.path)
++                q = urllib.parse.parse_qs(u.query)
++                if q.get("k", [""])[0] != owner.token:
++                    return self._send(403, "잘못된 주소예요. 플레이어에 보이는 QR/주소로 다시 접속해 주세요.", "text/plain; charset=utf-8")
++                if u.path == "/":
++                    return self._send(200, REMOTE_HTML.replace("ACCENT", owner.accent), "text/html; charset=utf-8")
++                if u.path == "/api/state":
++                    return self._send(200, json.dumps(owner.state, ensure_ascii=False), "application/json; charset=utf-8")
++                if u.path == "/api/cmd":
++                    owner.command.emit(q.get("c", [""])[0], q.get("v", [""])[0])
++                    return self._send(200, "{}", "application/json")
++                self._send(404, "not found", "text/plain")
++
++        for port in range(8765, 8785):
++            try:
++                self.httpd = ThreadingHTTPServer(("0.0.0.0", port), H)
++                self.port = port
++                break
++            except OSError:
++                continue
++        if not self.httpd:
++            raise RuntimeError("빈 포트를 찾지 못했어요")
++        self.httpd.daemon_threads = True
++        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
++        return self.url()
++
++    def url(self):
++        return f"http://{lan_ip()}:{self.port}/?k={self.token}"
++
++    def stop(self):
++        if self.httpd:
++            try:
++                self.httpd.shutdown()
++                self.httpd.server_close()
++            except Exception:
++                pass
++            self.httpd = None
++
++
++def qr_image(text, scale=8):
++    try:
++        import qrcode
++    except Exception:
++        return None
++    q = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
++    q.add_data(text)
++    q.make(fit=True)
++    mat = q.get_matrix()
++    n = len(mat)
++    img = QImage(n * scale, n * scale, QImage.Format_RGB32)
++    img.fill(QColor("white"))
++    p = QPainter(img)
++    for y, row in enumerate(mat):
++        for x, v in enumerate(row):
++            if v:
++                p.fillRect(x * scale, y * scale, scale, scale, QColor("black"))
++    p.end()
++    return img
+diff --git a/src/player_app.py b/src/player_app.py
+index 89407b8..799c0c8 100644
+--- a/src/player_app.py
++++ b/src/player_app.py
+@@ -8,7 +8,7 @@ import tempfile
+ import time
+ 
+ from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QUrl, QSize, QRect
+-from PySide6.QtGui import QAction, QActionGroup, QCursor, QGuiApplication, QDesktopServices, QImage, QKeySequence
++from PySide6.QtGui import QAction, QActionGroup, QCursor, QGuiApplication, QDesktopServices, QImage, QKeySequence, QColor
+ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget, QSplitter,
+                                QMenu, QFileDialog, QInputDialog, QMessageBox, QProgressDialog,
+                                QApplication, QListWidgetItem, QTabWidget)
+@@ -24,6 +24,8 @@ from store import default_shot_dir, data_dir
+ from thumbs import Thumbnailer
+ from updater import Updater, run_installer, ToolFetcher, update_ytdlp_async
+ from version import APP_NAME, VERSION
++from extras_ui import ExtrasMixin
++import widgets as W
+ from widgets import (ControlBar, PlaylistPanel, WelcomePage, ThumbPopup, make_icon, fmt_time, build_style,
+                      ACCENT, FG, DIM)
+ 
+@@ -94,7 +96,7 @@ class VideoHost(QWidget):
+         self.setMinimumSize(160, 90)
+ 
+ 
+-class MainWindow(QMainWindow):
++class MainWindow(ExtrasMixin, QMainWindow):
+     sig_key = Signal(str)
+     sig_loaded = Signal()
+     sig_end = Signal(str, str)
+@@ -105,7 +107,8 @@ class MainWindow(QMainWindow):
+         self.setWindowTitle(APP_NAME)
+         self.setWindowIcon(make_icon("app", size=256))
+         self.setAcceptDrops(True)
+-        self.setStyleSheet(build_style())
++        W.ACCENT.setRgb(QColor(store["accent"]).rgb())
++        self.setStyleSheet(build_style(store["accent"]))
+         self.setMinimumSize(480, 300)
+ 
+         # 상태
+@@ -191,6 +194,9 @@ class MainWindow(QMainWindow):
+         b.b_menu.clicked.connect(lambda: self.show_menu(b.b_menu.mapToGlobal(QPoint(0, 0)), above=b.b_menu))
+         b.b_speed.clicked.connect(lambda: self._popup(self._speed_menu(), b.b_speed))
+         b.b_ab.clicked.connect(self.ab_cycle)
++        b.b_ab.setContextMenuPolicy(Qt.CustomContextMenu)
++        b.b_ab.customContextMenuRequested.connect(self.ab_context_menu)
++        b.b_ab.setToolTip("구간 반복: [ 시작점, ] 끝점, \\ 해제 · 우클릭: 구간을 MP4/GIF로 저장")
+         b.b_repeat.clicked.connect(self.cycle_repeat)
+         b.b_cc.clicked.connect(self.toggle_sub)
+         b.b_cc.setContextMenuPolicy(Qt.CustomContextMenu)
+@@ -249,6 +255,7 @@ class MainWindow(QMainWindow):
+             self.split.setSizes([self.width() - store["playlist_width"], store["playlist_width"]])
+         self._refresh_welcome()
+         self._refresh_repeat_icon()
++        self.init_extras()
+ 
+         if after_update and store.session.get("path") and not initial_args:
+             sess = store.session
+@@ -265,6 +272,8 @@ class MainWindow(QMainWindow):
+         extra = {}
+         if os.environ.get("CFP_VO"):
+             extra["vo"] = os.environ["CFP_VO"]
++        if os.environ.get("CFP_AO"):
++            extra["ao"] = os.environ["CFP_AO"]
+         self.m = mpv.MPV(wid=str(int(self.video.winId())), input_default_bindings=False, **extra,
+                          input_vo_keyboard=True, osc=False, idle="yes", keep_open="yes",
+                          log_handler=self._mpv_log, loglevel="warn")
+@@ -823,6 +832,10 @@ class MainWindow(QMainWindow):
+             p = it.data(Qt.UserRole)
+             if not is_url(p):
+                 m.addAction("탐색기에서 보기", lambda: self.reveal(p))
++                if p in self.store.watched or p in self.store.positions:
++                    m.addAction("시청 기록 지우기", lambda: self.unmark_watched(p))
++                else:
++                    m.addAction("다 본 것으로 표시", lambda: self.mark_watched(p))
+             m.addSeparator()
+         for a in self._playlist_menu().actions():
+             m.addAction(a)
+@@ -920,6 +933,7 @@ class MainWindow(QMainWindow):
+             self.thumbs.set_file(self.current, dur)
+         else:
+             self.thumbs.set_file(None)
++        self.extras_file_loaded()
+         self._refresh_markers()
+         if self.ask_resume_pos:
+             pos = self.ask_resume_pos
+@@ -951,6 +965,7 @@ class MainWindow(QMainWindow):
+         self.eof_handled = True
+         if self.current and not is_url(self.current):
+             self.store.positions.pop(self.current, None)
++            self.mark_watched(self.current)
+         if self.store["repeat"] == "one":
+             return
+         if self.store["autoplay_next"] or self.store["repeat"] == "all":
+@@ -1014,6 +1029,7 @@ class MainWindow(QMainWindow):
+                     self.window_scale(None)
+         # 이어보기 위치 저장
+         now = time.time()
++        self.extras_poll(now, pos, pause)
+         if self.loaded and now - self.last_save > 5:
+             self.last_save = now
+             self._save_position(pos, dur)
+@@ -1064,6 +1080,8 @@ class MainWindow(QMainWindow):
+         if dur is None:
+             dur = self._get("duration", None)
+         self.store.set_resume(self.current, pos, dur)
++        if pos and dur and dur > 60 and pos > dur - 15:
++            self.mark_watched(self.current)
+         self.store.session = {"path": self.current, "pos": pos, "t": int(time.time())}
+ 
+     def _refresh_markers(self):
+@@ -1074,7 +1092,7 @@ class MainWindow(QMainWindow):
+         sb.update()
+ 
+     def _refresh_welcome(self):
+-        self.welcome.set_recent(self.store.recent, self.store.positions)
++        self.welcome.set_recent(self.store.recent, self.store.positions, self.store.watched)
+ 
+     # ================================================================ 재생 조작
+     def toggle_pause(self):
+@@ -1364,7 +1382,8 @@ class MainWindow(QMainWindow):
+             if g:
+                 filters.append(f"equalizer=f={f}:width_type=o:width=1:g={g}")
+         self._set("audio-channels", s["audio_channels"] or "auto")
+-        af = f"lavfi=[{','.join(filters)}]" if filters else ""
++        parts = [f"lavfi=[{','.join(filters)}]"] if filters else []
++        af = ",".join(self.extras_af(parts))
+         if not self._set("af", af):
+             self._set("af", "")
+ 
+@@ -1819,6 +1838,8 @@ class MainWindow(QMainWindow):
+         self._act(zm, "기본값", lambda: (self._set("sub-scale", 1.0), self._set("sub-pos", int(self.store["sub_pos"])),
+                                        self.osd("자막 크기·위치 기본값")))
+         self._act(m, "자막 모양 설정…", lambda: self.open_settings(tab=3))
++        m.addSeparator()
++        self._act(m, "자동 자막 만들기 (음성 인식)…", self.open_autosub, enabled=self.loaded)
+         return m
+ 
+     def build_menu(self):
+@@ -1859,6 +1880,7 @@ class MainWindow(QMainWindow):
+         for k, t in (("off", "반복 안 함"), ("all", "전체 반복"), ("one", "한 개 반복")):
+             self._act(rpm, t, lambda k=k: self.set_repeat(k), checked=self.store["repeat"] == k)
+         self._act(pm, "무작위 재생", self.toggle_shuffle, checked=self.store["shuffle"])
++        self._act(pm, "무음 구간 빨리 감기", self.toggle_skip_silence, checked=self.store["skip_silence"])
+         chs = self._get("chapter-list", []) or []
+         if chs:
+             cm = pm.addMenu(f"챕터 ({len(chs)})")
+@@ -1914,6 +1936,9 @@ class MainWindow(QMainWindow):
+         self._act(zm, "아래로", lambda: self.pan(0, -0.05))
+         self._act(zm, "초기화", self.zoom_reset, "Ctrl+0")
+         self._act(vm, "영상 조정 (밝기·대비·채도)…", self.open_adjust)
++        self.upscale_menu(vm)
++        self._act(vm, "앰비언트 모드 (여백을 장면 색으로)", self.toggle_ambient, checked=self.store["ambient"])
++        self.theme_menu(vm)
+         dim = vm.addMenu("디인터레이스")
+         for k, t in (("auto", "자동"), ("yes", "켬"), ("no", "끔")):
+             self._act(dim, t, lambda k=k: self.set_deinterlace(k), checked=self.store["deinterlace"] == k)
+@@ -1953,8 +1978,10 @@ class MainWindow(QMainWindow):
+         self._act(sm, "자막 없이 캡처", lambda: self.screenshot(False), enabled=loaded)
+         self._act(sm, "클립보드로 복사", self.screenshot_clipboard, "Ctrl+C", enabled=loaded)
+         self._act(sm, "캡처 폴더 열기", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self._shot_dir())))
++        self.capture_extras(sm)
+         m.addSeparator()
+         self._act(m, "재생목록", self.toggle_playlist, "P", checked=self.plist.isVisible())
++        self._act(m, "폰 리모컨" + (" (켜짐)" if self.remote else "") + "…", self.open_remote)
+         self._act(m, "미디어 정보", self.media_info, "Ctrl+I", enabled=loaded)
+         m.addSeparator()
+         self._act(m, "환경설정…", self.open_settings, "F5")
+@@ -2121,6 +2148,7 @@ class MainWindow(QMainWindow):
+         if not getattr(self, "updating", False):
+             self.store.session = {}
+         self.store.save()
++        self.extras_close()
+         self.thumbs.stop()
+         self.thumb_popup.close()
+         for d in (self.eq_dlg, self.adjust_dlg):
+diff --git a/src/store.py b/src/store.py
+index d372975..95db480 100644
+--- a/src/store.py
++++ b/src/store.py
+@@ -56,6 +56,10 @@ DEFAULTS = {
+     "volume_max": 200,
+     "audio_preset": "off",
+     "audio_channels": "auto",
++    "skip_silence": False,
++    "upscale": "off",               # off | hq | fsr | anime_fast | anime_hq
++    "ambient": False,
++    "accent": "#ff5c8a",
+     "eq": [0] * 10,
+     "audio_lang": "ko,kor,kr,ja,jpn,en,eng",
+     # 자막
+@@ -89,6 +93,7 @@ class Store:
+         self.recent = h.get("recent", [])         # [path]
+         self.bookmarks = h.get("bookmarks", {})   # path -> [[sec, label]]
+         self.session = h.get("session", {})       # 마지막 재생 상태 (업데이트 후 복원용)
++        self.watched = h.get("watched", {})       # 다 본 영상 path -> 시각
+ 
+     @staticmethod
+     def _load(path, fallback):
+@@ -122,6 +127,7 @@ class Store:
+                 "recent": self.recent,
+                 "bookmarks": self.bookmarks,
+                 "session": self.session,
++                "watched": self.watched,
+             })
+ 
+     # ---- 이어보기 ----
+diff --git a/src/thumbs.py b/src/thumbs.py
+index ea11e3b..1a3c2d3 100644
+--- a/src/thumbs.py
++++ b/src/thumbs.py
+@@ -12,6 +12,13 @@ except Exception:  # PyAV 없으면 미리보기만 꺼짐
+ THUMB_W = 192
+ 
+ 
++def _is_cover(s):
++    try:
++        return bool(int(s.disposition) & 0x400)  # 앨범 아트
++    except Exception:
++        return False
++
++
+ class Thumbnailer(QObject):
+     ready = Signal(str, int, QImage)   # path, bucket, image
+ 
+@@ -71,8 +78,7 @@ class Thumbnailer(QObject):
+             return False
+         try:
+             self.container = av.open(path, options={"probesize": "5000000"})
+-            vs = [s for s in self.container.streams if s.type == "video"
+-                  and not (s.disposition and getattr(s.disposition, "attached_pic", False))]
++            vs = [s for s in self.container.streams if s.type == "video" and not _is_cover(s)]
+             if not vs:
+                 self._close()
+                 return False
+diff --git a/src/version.py b/src/version.py
+index a4d3e81..6b1f4b4 100644
+--- a/src/version.py
++++ b/src/version.py
+@@ -1,6 +1,6 @@
+ APP_NAME = "코덱무관플레이어"
+ APP_ID = "CodecFreePlayer"
+-VERSION = "2.0.0"
++VERSION = "2.1.0"
+ 
+ # 자동 업데이트를 받을 GitHub 저장소 (공개 저장소)
+ GITHUB_OWNER = "sansan123123cc"
+diff --git a/src/widgets.py b/src/widgets.py
+index 98c14b5..f846484 100644
+--- a/src/widgets.py
++++ b/src/widgets.py
+@@ -528,7 +528,7 @@ class WelcomePage(QWidget):
+         v.addWidget(hint)
+         v.addStretch(3)
+ 
+-    def set_recent(self, paths, positions):
++    def set_recent(self, paths, positions, watched=None):
+         self.recent.clear()
+         shown = 0
+         for p in paths:
+@@ -541,6 +541,8 @@ class WelcomePage(QWidget):
+             e = positions.get(p)
+             if e and e.get("dur"):
+                 name += f"   ·  {fmt_time(e['pos'])} / {fmt_time(e['dur'])}에서 이어보기"
++            elif watched and p in watched:
++                name += "   ·  ✓ 다 봄"
+             it = QListWidgetItem(name)
+             it.setToolTip(p)
+             it.setData(Qt.UserRole, p)
+@@ -606,7 +608,7 @@ QProgressBar::chunk {{ background: #ff5c8a; border-radius: 4px; }}
+ """
+ 
+ 
+-def build_style():
++def build_style(accent="#ff5c8a"):
+     """체크 표시 그림을 임시 폴더에 만들어 스타일시트에 연결."""
+     import tempfile
+     path = os.path.join(tempfile.gettempdir(), "cfp_check.png").replace("\\", "/")
+@@ -620,5 +622,10 @@ def build_style():
+         p.end()
+         pm.save(path, "PNG")
+     except Exception:
+-        return STYLE.replace("image: url(CHECKMARK);", "")
+-    return STYLE.replace("CHECKMARK", path)
++        return _accent(STYLE.replace("image: url(CHECKMARK);", ""), accent)
++    return _accent(STYLE.replace("CHECKMARK", path), accent)
++
++
++def _accent(css, accent):
++    c = QColor(accent)
++    return css.replace("#ff5c8a", c.name()).replace("rgba(255,92,138,", f"rgba({c.red()},{c.green()},{c.blue()},")
